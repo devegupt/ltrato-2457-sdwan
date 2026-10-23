@@ -1,0 +1,127 @@
+---
+image: danischm/nac@sha256:fec81ec4a34cd2e400124aa43f54f00dc3056783ad50d4d5018483d568299404
+stages:
+  - validate
+  - plan
+  - deploy
+  - test
+
+variables:
+  GIT_SSL_NO_VERIFY: "true"
+  SDWAN_USERNAME:
+    description: "Cisco SD-WAN Username"
+  SDWAN_PASSWORD:
+    description: "Cisco SD-WAN Password"
+  SDWAN_URL:
+    description: "Cisco SD-WAN URL"
+  GITLAB_TOKEN:
+    description: "User Access Token. Used to create comments on Merge Requests"
+  TF_HTTP_USERNAME:
+    description: "GitLab Username"
+    value: "gitlab-ci-token"
+  TF_HTTP_PASSWORD:
+    description: "GitLab Access Token"
+    value: "${CI_JOB_TOKEN}"
+  GITLAB_API_URL:
+    description: "GitLab API v4 root URL"
+    value: "${CI_API_V4_URL}"
+  TF_HTTP_ADDRESS:
+    description: "GitLab HTTP Address to store the TF state file"
+    value: "${GITLAB_API_URL}/projects/${CI_PROJECT_ID}/terraform/state/tfstate"
+  TF_HTTP_LOCK_ADDRESS:
+    description: "GitLab HTTP Address to lock the TF state file"
+    value: ${TF_HTTP_ADDRESS}/lock
+  TF_HTTP_LOCK_METHOD:
+    description: "Method to lock TF state file"
+    value: POST
+  TF_HTTP_UNLOCK_ADDRESS:
+    description: "GitLab HTTP Address to unlock the TF state file"
+    value: ${TF_HTTP_ADDRESS}/lock
+  TF_HTTP_UNLOCK_METHOD:
+    description: "Method to unlock TF state file"
+    value: DELETE
+
+cache:
+  key: terraform_modules_and_lock
+  paths:
+    - .terraform
+    - .terraform.lock.hcl
+
+validate:
+  stage: validate
+  script:
+    - set -o pipefail && terraform fmt -check |& tee fmt_output.txt
+    - set -o pipefail && iac-validate --non-strict ./data/ -s ./.schema.yaml -r ./.rules/ |& tee validate_output.txt
+  artifacts:
+    when: always
+    paths:
+      - fmt_output.txt
+      - validate_output.txt
+  cache: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+plan:
+  stage: plan
+  resource_group: sdwan
+  script:
+    - terraform init -input=false
+    - terraform plan -out=plan.tfplan -input=false
+    - terraform show -no-color plan.tfplan > plan.txt
+    - terraform show -json plan.tfplan | jq > plan.json
+    - terraform show -json plan.tfplan | jq '([.resource_changes[]?.change.actions?]|flatten)|{"create":(map(select(.=="create"))|length),"update":(map(select(.=="update"))|length),"delete":(map(select(.=="delete"))|length)}' > plan_gitlab.json
+  artifacts:
+    when: always
+    paths:
+      - plan.json
+      - plan.txt
+      - plan.tfplan
+      - plan_gitlab.json
+    reports:
+      terraform: plan_gitlab.json
+  needs:
+    - validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+deploy:
+  stage: deploy
+  resource_group: sdwan
+  script:
+    - terraform init -input=false
+    - terraform apply -input=false -auto-approve plan.tfplan
+  artifacts:
+    when: always
+    paths:
+      - defaults.yaml
+  dependencies:
+    - plan
+  needs:
+    - plan
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "main"
+
+test-integration:
+  stage: test
+  script:
+    - set -o pipefail && iac-test -d ./data -d ./defaults.yaml -t ./tests/templates -o ./tests/results/sdwan |& tee test_output.txt
+  artifacts:
+    when: always
+    paths:
+      - tests/results/sdwan/*.html
+      - tests/results/sdwan/xunit.xml
+      - test_output.txt
+    reports:
+      junit: tests/results/sdwan/xunit.xml
+  dependencies:
+    - deploy
+  needs:
+    - deploy
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "main"
